@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                BerkeleyDB-Manager
-version:             0.03
+version:             0.04
 abstract:            ~
 license:             ~
 author:              ~
@@ -8,6 +8,7 @@ generated_by:        ExtUtils::MakeMaker version 6.44
 distribution_type:   module
 requires:     
     BerkeleyDB:                    0
+    Data::Stream::Bulk:            0
     Moose:                         0
     namespace::clean:              0.08
     Test::Exception:               0

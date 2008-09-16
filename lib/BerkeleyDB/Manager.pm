@@ -7,14 +7,13 @@ use Carp qw(croak);
 
 use BerkeleyDB;
 
-use Scope::Guard;
 use Data::Stream::Bulk::Util qw(nil);
 use Data::Stream::Bulk::Callback;
 use Data::Stream::Bulk::Array;
 
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.03";
+our $VERSION = "0.04";
 
 has open_dbs => (
 	isa => "HashRef",
@@ -300,13 +299,15 @@ sub txn_do {
 
     my @result;
 
+	my $wantarray = wantarray; # gotta capture, eval { } has its own
+
     my ( $success, $err ) = do {
         local $@;
 
         my $success = eval {
-            if ( wantarray ) {
+            if ( $wantarray ) {
                 @result = $coderef->(@_);
-            } elsif( defined wantarray ) {
+            } elsif( defined $wantarray ) {
                 $result[0] = $coderef->(@_);
             } else {
                 $coderef->(@_);
@@ -372,12 +373,16 @@ sub txn_rollback {
 	return 1;
 }
 
-sub dup_cursor_to_stream {
+sub dup_cursor_stream {
 	my ( $self, @args ) = @_;
 
 	my %args = @args;
 
 	my ( $init, $key, $first, $cb, $cursor, $db, $n ) = delete @args{qw(init key callback_first callback cursor db chunk_size)};
+
+	my ( $values, $keys ) = @args{qw(values keys)};
+	my $pairs = !$values && !$keys;
+	croak "'values' and 'keys' are mutually exclusive" if $values && $keys;
 
 	$key ||= '';
 
@@ -390,7 +395,7 @@ sub dup_cursor_to_stream {
 		my $ret;
 
 		if ( ( $ret = $c->c_get($key, $v, DB_SET) ) == 0 ) {
-			push(@$r, [ $key, $v ]);
+			push(@$r, $pairs ? [ $key, $v ] : ( $values ? $v : $key ));
 		} elsif ( $ret == DB_NOTFOUND ) {
 			return;
 		} else {
@@ -404,7 +409,7 @@ sub dup_cursor_to_stream {
 		my $v;
 		my $ret;
 		if ( ( $ret = $c->c_get($key, $v, DB_NEXT_DUP) ) == 0 ) {
-			push(@$r, [ $key, $v ]);
+			push(@$r, $pairs ? [ $key, $v ] : ( $values ? $v : $key ));
 		} elsif ( $ret == DB_NOTFOUND ) {
 			return;
 		} else {
@@ -432,7 +437,7 @@ sub dup_cursor_to_stream {
 			}
 
 			# and defer the rest
-			my $rest = $self->cursor_to_stream(@args, callback => $cb, cursor => $cursor);
+			my $rest = $self->cursor_stream(@args, callback => $cb, cursor => $cursor);
 			return $bulk->cat($rest);
 		}
 
@@ -442,10 +447,14 @@ sub dup_cursor_to_stream {
 	}
 }
 
-sub cursor_to_stream {
+sub cursor_stream {
     my ( $self, %args ) = @_;
 
 	my ( $init, $cb, $cursor, $db, $f, $n ) = delete @args{qw(init callback cursor db flag chunk_size)};
+
+	my ( $values, $keys ) = @args{qw(values keys)};
+	my $pairs = !$values && !$keys;
+	croak "'values' and 'keys' are mutually exclusive" if $values && $keys;
 
 	$cursor ||= ( $db || croak "either 'cursor' or 'db' is a required argument" )->db_cursor;
 
@@ -458,7 +467,7 @@ sub cursor_to_stream {
 			my ( $c, $r ) = @_;
 
 			if ( $c->c_get($k, $v, $f) == 0 ) {
-				push(@$r, [ $k, $v ]);
+				push(@$r, $pairs ? [ $k, $v ] : ( $values ? $v : $k ));
 			} elsif ( $c->status == DB_NOTFOUND ) {
 				return;
 			} else {
@@ -517,6 +526,9 @@ BerkeleyDB::Manager - General purpose L<BerkeleyDB> wrapper
 		$db->db_put("foo", "bar");
 		die "error!"; # rolls back
 	});
+
+	# fetch all key/value pairs as a Data::Stream::Bulk
+	my $pairs = $m->cursor_stream( db => $db );
 
 =head1 DESCRIPTION
 
@@ -592,7 +604,7 @@ The hash of currently open dbs.
 
 =item chunk_size
 
-See C<cursor_to_stream>.
+See C<cursor_stream>.
 
 Defaults to 500.
 
@@ -699,7 +711,7 @@ See the BDB documentation for more details.
 
 Returns a list of all the registered databases.
 
-=item cursor_to_stream %args
+=item cursor_stream %args
 
 Fetches data from a cursor, returning a L<Data::Stream::Bulk>.
 
@@ -711,7 +723,7 @@ triplets from a secondary index, you can use this callback:
 
 	my ( $sk, $pk, $v ) = ( '', '', '' ); # to avoid uninitialized warnings from BDB
 
-	$m->cursor_to_stream(
+	$m->cursor_stream(
 		db => $db,
 		callback => {
 			my ( $cursor, $accumilator ) = @_;
@@ -731,16 +743,19 @@ each cursor position. C<flag> can be passed, and defaults to C<DB_NEXT>.
 C<chunk_size> controls the number of pairs returned in each chunk. If it isn't
 provided the attribute C<chunk_size> is used instead.
 
+If C<values> or C<keys> is set to a true value then only values or keys will be
+returned. These two arguments are mutually exclusive.
+
 Lastly, C<init> is an optional callback that is invoked once before each chunk,
 that can be used to set up the database. The return value is retained until the
 chunk is finished, so this callback can return a L<Scope::Guard> to perform
 cleanup.
 
-=item dup_cursor_to_stream %args
+=item dup_cursor_stream %args
 
-A specialization of C<cursor_to_stream> for fetching duplicate key entries.
+A specialization of C<cursor_stream> for fetching duplicate key entries.
 
-Takes the same arguments as C<cursor_to_stream>, but adds a few more.
+Takes the same arguments as C<cursor_stream>, but adds a few more.
 
 C<key> can be passed in to initialize the cursor with C<DB_SET>.
 
