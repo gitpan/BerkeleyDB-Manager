@@ -1,0 +1,10 @@
+- test recno, queue, etc
+- perllish convenience wrapper for db_set, db_get, etc?
+	- BDB::Wrapper is only for opening stuff
+	- BerkeleyDB::Lite is too shiny
+	- KISS:
+		- ->get returns list if dup, scalar if not
+		- ->delete deletes all dups
+		- ->set adds on dup, sets on non
+		- ->exists convenience wrapper
+		- all check status and die on error (except get for !exists)
