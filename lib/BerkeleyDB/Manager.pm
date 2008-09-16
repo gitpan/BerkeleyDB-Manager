@@ -9,7 +9,7 @@ use BerkeleyDB;
 
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.01";
+our $VERSION = "0.02";
 
 has open_dbs => (
 	isa => "HashRef",
@@ -17,12 +17,12 @@ has open_dbs => (
 	default => sub { +{} },
 );
 
-has [qw(dup dupsort)] => (
+has [qw(dup dupsort)] => ( # read_uncomitted log_autoremove multiversion
 	isa => "Bool",
 	is  => "ro",
 );
 
-has [qw(autocommit transactions recover create)] => (
+has [qw(autocommit transactions recover create)] => ( # snapshot, sync
 	isa => "Bool",
 	is  => "ro",
 	default => 1,
@@ -64,12 +64,12 @@ sub _build_env_flags {
 
 	if ( $self->transactions ) {
 		$flags |= DB_INIT_TXN;
+
+		if ( $self->recover ) {
+			$flags |= DB_REGISTER | DB_RECOVER;
+		}
 	}
 
-	if ( $self->recover ) {
-		$flags |= DB_REGISTER | DB_RECOVER;
-	}
-	
 	if ( $self->create ) {
 		$flags |= DB_CREATE;
 	}
@@ -87,7 +87,7 @@ sub _build_env {
     my $self = shift;
 
     BerkeleyDB::Env->new(
-        ( $self->has_home ? ( -Home  => $self->home ) : () ),
+        ( $self->has_home ? ( -Home => $self->home ) : () ),
         -Flags => $self->env_flags,
     ) || die $BerkeleyDB::Error;
 }
@@ -105,7 +105,7 @@ sub build_db_flags {
 
 	my $flags = 0;
 
-	if ( $args{autocommit} ) {
+	if ( $args{autocommit} and $self->env_flags & DB_INIT_TXN && !$self->_current_transaction ) {
 		$flags |= DB_AUTO_COMMIT;
 	}
 
@@ -131,7 +131,7 @@ sub build_db_properties {
 
 	if ( $args{dup} ) {
 		$props |= DB_DUP;
-		
+
 		if ( $args{dupsort} ) {
 			$props |= DB_DUPSORT;
 		}
@@ -160,7 +160,7 @@ sub instantiate_db {
 
 	my $flags = $args{flags}      || $self->build_db_flags(%args);
 	my $props = $args{properties} || $self->build_db_properties(%args);
-	
+
 	my $txn   = $args{txn} || ( $self->env_flags & DB_INIT_TXN && $self->_current_transaction );
 
 	$class->new(
@@ -197,19 +197,23 @@ sub open_db {
 sub register_db {
 	my ( $self, $name, $db ) = @_;
 
+	if ( my $frame = $self->_transaction_stack->[-1] ) {
+		push @$frame, $name;
+	}
+
 	$self->open_dbs->{$name} = $db;
 }
 
 sub close_db {
 	my ( $self, $name ) = @_;
 
-	delete $self->open_dbs->{$name};
+	delete($self->open_dbs->{$name})->db_close;
 }
 
 sub all_open_dbs {
 	my $self = shift;
 	values %{ $self->open_dbs };
-}	
+}
 
 sub associate {
 	my ( $self, %args ) = @_;
@@ -244,17 +248,31 @@ has _transaction_stack => (
 
 sub _current_transaction {
 	my $self = shift;
-	$self->_transaction_stack->[-1];
+
+	if ( my $frame = $self->_transaction_stack->[-1] ) {
+		return $frame->[0];
+	}
+
+	return;
 }
 
 sub _push_transaction {
 	my ( $self, $txn ) = @_;
-	push @{ $self->_transaction_stack }, $txn;
+	push @{ $self->_transaction_stack }, [ $txn ];
 }
 
 sub _pop_transaction {
 	my ( $self ) = @_;
-	pop @{ $self->_transaction_stack };
+
+	if ( my $d = pop @{ $self->_transaction_stack } ) {
+		my ( $txn, @dbs ) = @$d;
+
+		$self->close_db($_) for @dbs;
+
+		return $txn;
+	} else {
+		croak "Transaction stack underflowed";
+	}
 }
 
 sub txn_do {
@@ -407,8 +425,6 @@ If true (the default) C<DB_REGISTER> and C<DB_RECOVER> are enabled in the flags
 to the env.
 
 This will enable automatic recovery in case of a crash.
-
-=item 
 
 =item dup
 
