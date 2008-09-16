@@ -1,0 +1,9 @@
+lib/BerkeleyDB/Manager.pm
+Makefile.PL
+MANIFEST			This list of files
+MANIFEST.SKIP
+t/01_basic.t
+t/02_txn.t
+t/03_associate.t
+META.yml                                 Module meta-data (added by MakeMaker)
+SIGNATURE                                Public-key signature (added by MakeMaker)
