@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                BerkeleyDB-Manager
-version:             0.05
+version:             0.06
 abstract:            ~
 license:             ~
 author:              ~
@@ -11,6 +11,7 @@ requires:
     Data::Stream::Bulk:            0
     Moose:                         0
     namespace::clean:              0.08
+    Path::Class:                   0
     Test::Exception:               0
     Test::TempDir:                 0
     Test::use::ok:                 0

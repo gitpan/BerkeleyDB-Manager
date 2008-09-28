@@ -11,9 +11,17 @@ use Data::Stream::Bulk::Util qw(nil);
 use Data::Stream::Bulk::Callback;
 use Data::Stream::Bulk::Array;
 
+use Path::Class;
+
+use Moose::Util::TypeConstraints;
+
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.05";
+our $VERSION = "0.06";
+
+coerce( __PACKAGE__,
+	from HashRef => via { __PACKAGE__->new(%$_) },
+);
 
 has open_dbs => (
 	isa => "HashRef",
@@ -21,12 +29,24 @@ has open_dbs => (
 	default => sub { +{} },
 );
 
-has [qw(dup dupsort)] => ( # read_uncomitted log_autoremove multiversion
+has [qw(
+	dup
+	dupsort
+	recover
+	create
+	multiversion
+	readonly
+	log_auto_remove
+)] => (
 	isa => "Bool",
 	is  => "ro",
 );
 
-has [qw(autocommit transactions recover create)] => ( # snapshot, sync
+has [qw(
+	autocommit
+	transactions
+	sync
+)] => (
 	isa => "Bool",
 	is  => "ro",
 	default => 1,
@@ -35,6 +55,21 @@ has [qw(autocommit transactions recover create)] => ( # snapshot, sync
 has home => (
     is  => "ro",
 	predicate => "has_home",
+);
+
+has log_dir => (
+	is => "ro",
+	predicate => "has_log_dir",
+);
+
+has temp_dir => (
+	is => "ro",
+	predicate => "has_temp_dir",
+);
+
+has data_dir => (
+	is => "ro",
+	predicate => "has_data_dir",
 );
 
 has db_class => (
@@ -87,6 +122,22 @@ sub _build_env_flags {
 	return $flags;
 }
 
+has env_config => (
+	isa => "HashRef",
+	is  => "ro",
+	lazy_build => 1,
+);
+
+sub _build_env_config {
+	my $self = shift;
+
+	return {
+		( $self->has_log_dir  ? ( DB_LOG_DIR  => $self->log_dir  ) : () ),
+		( $self->has_data_dir ? ( DB_DATA_DIR => $self->data_dir ) : () ),
+		( $self->has_temp_dir ? ( DB_TEMP_DIR => $self->temp_dir ) : () ),
+	};
+}
+
 has env => (
     isa => "BerkeleyDB::Env",
     is  => "ro",
@@ -96,31 +147,94 @@ has env => (
 sub _build_env {
     my $self = shift;
 
-    BerkeleyDB::Env->new(
-        ( $self->has_home ? ( -Home => $self->home ) : () ),
-        -Flags => $self->env_flags,
-    ) || die $BerkeleyDB::Error;
+	if ( $self->create ) {
+		my $home = $self->has_home ? dir($self->home) : dir();
+
+		$home->mkpath unless -d $home;
+
+		foreach my $name ( "log_dir", "data_dir", "temp_dir" ) {
+			my $pred = "has_$name";
+			next unless $self->$pred;
+
+			my $dir = $home->subdir( $self->$name );
+
+			$dir->mkpath unless -d $dir;
+		}
+	}
+
+	my $env = BerkeleyDB::Env->new(
+		( $self->has_home ? ( -Home => $self->home ) : () ),
+		-Flags  => $self->env_flags,
+		-Config => $self->env_config,
+	) || die $BerkeleyDB::Error;
+
+	if ( $self->log_auto_remove ) {
+		if ( $env->can("log_set_config") ) {
+			$env->log_set_config( DB_LOG_AUTO_REMOVE, 1 );
+		} else {
+			croak "log_auto_remove specified but the log_set_config method is not available in this version of BerkeleyDB";
+		}
+	}
+
+	return $env;
 }
 
 sub build_db_flags {
 	my ( $self, %args ) = @_;
 
-	if ( $self->has_db_flags ) {
-		return $self->db_flags;
-	}
-
-	foreach my $opt ( qw(autocommit create) ) {
-		$args{$opt} = $self->$opt unless exists $args{$opt};
+	if ( exists $args{flags} ) {
+		return $args{flags};
 	}
 
 	my $flags = 0;
 
-	if ( $args{autocommit} and $self->env_flags & DB_INIT_TXN && !$self->_current_transaction ) {
-		$flags |= DB_AUTO_COMMIT;
+	if ( $self->has_db_flags ) {
+		$flags = $self->db_flags;
+	} else {
+		foreach my $opt ( qw(create readonly) ) {
+			$args{$opt} = $self->$opt unless exists $args{$opt};
+		}
+
+		unless ( exists $args{autocommit} ) {
+			# if there is a current transaction the DB open and all subsequent
+			# operations are already protected by it, an specifying auto commit
+			# will fail
+			# furthermore, specifying autocommit without having transactions makes
+			# no sense
+			$args{autocommit} = $self->autocommit && $self->env_flags & DB_INIT_TXN && !$self->_current_transaction;
+		}
 	}
 
-	if ( $args{create} ) {
-		$flags |= DB_CREATE;
+	if ( exists $args{autocommit} ) {
+		if ( $args{autocommit} ) {
+			$flags |= DB_AUTO_COMMIT;
+		} else {
+			$flags &= ~DB_AUTO_COMMIT;
+		}
+	}
+
+	if ( exists $args{create} ) {
+		if ( $args{create} ) {
+			$flags |= DB_CREATE;
+		} else { 
+			$flags &= ~DB_CREATE;
+		}
+	}
+
+	if ( exists $args{readonly} ) {
+		if ( $args{readonly} ) {
+			$flags |= DB_RDONLY;
+		} else {
+			$flags &= ~DB_RDONLY;
+		}
+	}
+
+	if ( exists $args{multiversion} ) {
+		if ( $args{multiversion} ) {
+			$flags |= DB_MULTIVERSION;
+		} else {
+			$flags &= ~DB_MULTIVERSION;
+		}
 	}
 
 	return $flags;
@@ -174,12 +288,12 @@ sub instantiate_db {
 	my $txn   = $args{txn} || ( $self->env_flags & DB_INIT_TXN && $self->_current_transaction );
 
 	$class->new(
-        -Filename => $file,
-        -Env      => $self->env,
+		-Filename => $file,
+		-Env      => $self->env,
 		( $txn   ? ( -Txn      => $txn   ) : () ),
 		( $flags ? ( -Flags    => $flags ) : () ),
 		( $props ? ( -Property => $props ) : () ),
-    ) || $BerkeleyDB::Error;
+    ) || die $BerkeleyDB::Error;
 }
 
 sub get_db {
@@ -244,15 +358,15 @@ sub associate {
 	}
 
     if( $primary->associate( $secondary, sub {
-        my ( $id, $val ) = @_;
+		my ( $id, $val ) = @_;
 
 		if ( defined ( my $value = $callback->($id, $val) ) ) {
 			$_[2] = $value;
 		}
 
-        return 0;
+		return 0;
     } ) != 0 ) {
-        die $BerkeleyDB::Error;
+		die $BerkeleyDB::Error;
     }
 }
 
@@ -351,7 +465,7 @@ sub txn_do {
 sub txn_begin {
 	my ( $self, $parent_txn ) = @_;
 
-	my $txn = $self->env->TxnMgr->txn_begin($parent_txn || ()) || die $BerkeleyDB::Error;
+	my $txn = $self->env->TxnMgr->txn_begin($parent_txn || undef, $self->multiversion ? DB_TXN_SNAPSHOT : 0 ) || die $BerkeleyDB::Error;
 
 	$txn->Txn($self->all_open_dbs);
 
@@ -555,7 +669,11 @@ transaction journals, etc.
 =item create
 
 Whether C<DB_CREATE> is passed to C<Env> or C<instantiate_db> by default. Defaults to
-true.
+false.
+
+=item readonly
+
+Whether C<DB_RDONLY> is passed in the flags. Defaults to false.
 
 =item transactions
 
@@ -573,18 +691,59 @@ transaction, unless transactions are disabled.
 
 =item recover
 
-If true (the default) C<DB_REGISTER> and C<DB_RECOVER> are enabled in the flags
-to the env.
+If true C<DB_REGISTER> and C<DB_RECOVER> are enabled in the flags to the env.
 
 This will enable automatic recovery in case of a crash.
 
+See also the F<db_recover> utility, and
+L<file:///usr/local/BerkeleyDB/docs/gsg_txn/C/architectrecovery.html#multiprocessrecovery>
+
+=item multiversion
+
+Enables multiversioning concurrency.
+
+See
+L<http://www.oracle.com/technology/documentation/berkeley-db/db/gsg_txn/C/isolation.html#snapshot_isolation>
+
+This will also automatically open all transactions with snapshot isolation.
+
+=item log_auto_remove
+
+Enables automatic removal of logs.
+
+Normally logs should be removed after being backed up, but if you are not
+interested in having full snapshot backups for catastrophic recovery scenarios,
+you can enable this.
+
+See L<http://www.oracle.com/technology/documentation/berkeley-db/db/ref/transapp/logfile.html>.
+
+Defaults to false.
+
+=item sync
+
+Enables syncing of BDB log writing.
+
+Defaults to true.
+
+If disabled, transaction writing will not be synced. This means that in the
+event of a crash some successfully comitted transactions might still be rolled
+back during recovery, but the database will still be in tact and atomicity is
+still guaranteed.
+
+This is useful for bulk imports as it can significantly increase performance of
+smaller transactions.
+
 =item dup
 
-Enables C<DB_DUP> in C<-Properties> by default, allowing duplicate keys in the db.
+Enables C<DB_DUP> in C<-Properties>, allowing duplicate keys in the db.
+
+Defaults to false.
 
 =item dupsort
 
-Enables C<DB_DUPSORT> in C<-Properties> by default.
+Enables C<DB_DUPSORT> in C<-Properties>.
+
+Defaults to false.
 
 =item db_class
 
@@ -687,6 +846,8 @@ If C<$parent_txn> is provided the new transaction will be a child transaction.
 
 The new transaction is set as the active transaction for all registered
 database handles.
+
+If C<multiversion> is enabled C<DB_TXN_SNAPSHOT> is passed in as well.
 
 =item txn_commit $txn
 
