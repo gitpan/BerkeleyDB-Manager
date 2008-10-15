@@ -17,7 +17,7 @@ use Moose::Util::TypeConstraints;
 
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.06";
+our $VERSION = "0.07";
 
 coerce( __PACKAGE__,
 	from HashRef => via { __PACKAGE__->new(%$_) },
@@ -35,6 +35,7 @@ has [qw(
 	recover
 	create
 	multiversion
+	read_uncomitted
 	readonly
 	log_auto_remove
 )] => (
@@ -45,6 +46,7 @@ has [qw(
 has [qw(
 	autocommit
 	transactions
+	snapshot
 	sync
 )] => (
 	isa => "Bool",
@@ -234,6 +236,14 @@ sub build_db_flags {
 			$flags |= DB_MULTIVERSION;
 		} else {
 			$flags &= ~DB_MULTIVERSION;
+		}
+	}
+
+	if ( exists $args{read_uncomitted} ) {
+		if ( $args{read_uncomitted} ) {
+			$flags |= DB_READ_UNCOMMITTED;
+		} else {
+			$flags &= ~DB_READ_UNCOMMITTED;
 		}
 	}
 
@@ -465,7 +475,7 @@ sub txn_do {
 sub txn_begin {
 	my ( $self, $parent_txn ) = @_;
 
-	my $txn = $self->env->TxnMgr->txn_begin($parent_txn || undef, $self->multiversion ? DB_TXN_SNAPSHOT : 0 ) || die $BerkeleyDB::Error;
+	my $txn = $self->env->TxnMgr->txn_begin($parent_txn || undef, $self->multiversion && $self->snapshot ? DB_TXN_SNAPSHOT : 0 ) || die $BerkeleyDB::Error;
 
 	$txn->Txn($self->all_open_dbs);
 
@@ -705,7 +715,33 @@ Enables multiversioning concurrency.
 See
 L<http://www.oracle.com/technology/documentation/berkeley-db/db/gsg_txn/C/isolation.html#snapshot_isolation>
 
-This will also automatically open all transactions with snapshot isolation.
+=item snapshot
+
+Whether or not C<DB_TXN_SNAPSHOT> should be passed to C<txn_begin>.
+
+If C<multiversion> is not true, this is a noop.
+
+Defaults to true.
+
+Using C<DB_TXN_SNAPSHOT> means will cause copy on write multiversioning
+concurrency instead of locking concurrency.
+
+This can improve read responsiveness for applications with long running
+transactions, by allowing a page to be read even if it is being written to in
+another transaction since the writer is modifying its own copy of the page.
+
+This is an alternative to enabling reading of uncomitted data, and provides the
+same read performance while maintaining snapshot isolation at the cost of more
+memory.
+
+=item read_uncomitted
+
+Enables uncomitted reads.
+
+This breaks the I in ACID, since transactions are no longer isolated.
+
+A better approaach to increase read performance when there are long running
+writing transactions is to enable multiversioning.
 
 =item log_auto_remove
 
