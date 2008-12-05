@@ -17,7 +17,7 @@ use Moose::Util::TypeConstraints;
 
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.08";
+our $VERSION = "0.09";
 
 coerce( __PACKAGE__,
 	from HashRef => via { __PACKAGE__->new(%$_) },
@@ -34,6 +34,7 @@ has [qw(
 	dupsort
 	recover
 	create
+	truncate
 	multiversion
 	read_uncomitted
 	readonly
@@ -149,6 +150,8 @@ has env => (
 sub _build_env {
     my $self = shift;
 
+	my $flags = $self->env_flags;
+
 	if ( $self->create ) {
 		my $home = $self->has_home ? dir($self->home) : dir();
 
@@ -162,20 +165,38 @@ sub _build_env {
 
 			$dir->mkpath unless -d $dir;
 		}
+
+		my @config;
+
+		push @config, "set_lg_dir " . $self->log_dir if $self->has_log_dir;
+		push @config, "set_data_dir " . $self->data_dir if $self->has_data_dir;
+		push @config, "set_tmp_dir " . $self->temp_dir if $self->has_temp_dir;
+		push @config, "db_log_autoremove" if $self->log_auto_remove;
+
+		if ( $flags & DB_MULTIVERSION ) {
+			push @config, "db_multiversion";
+		}
+
+		if ( @config ) {
+			my $config = $home->file("DB_CONFIG");
+
+			unless ( -e $config ) {
+				my $fh = $config->openw;
+				$fh->print("set_lg_dir " . $self->log_dir . "\n") if $self->has_log_dir; # set_lg_dir is not a typo
+				$fh->print("set_data_dir " . $self->data_dir . "\n") if $self->has_data_dir;
+			}
+		}
 	}
 
 	my $env = BerkeleyDB::Env->new(
 		( $self->has_home ? ( -Home => $self->home ) : () ),
-		-Flags  => $self->env_flags,
+		-Flags  => $flags,
 		-Config => $self->env_config,
 	) || die $BerkeleyDB::Error;
 
 	if ( $self->log_auto_remove ) {
-		if ( $env->can("log_set_config") ) {
-			$env->log_set_config( DB_LOG_AUTO_REMOVE, 1 );
-		} else {
-			croak "log_auto_remove specified but the log_set_config method is not available in this version of BerkeleyDB";
-		}
+		$self->assert_version( 4.7, "log_auto_remove" );
+		$env->log_set_config( DB_LOG_AUTO_REMOVE, 1 );
 	}
 
 	return $env;
@@ -193,7 +214,7 @@ sub build_db_flags {
 	if ( $self->has_db_flags ) {
 		$flags = $self->db_flags;
 	} else {
-		foreach my $opt ( qw(create readonly) ) {
+		foreach my $opt ( qw(create readonly truncate) ) {
 			$args{$opt} = $self->$opt unless exists $args{$opt};
 		}
 
@@ -218,8 +239,16 @@ sub build_db_flags {
 	if ( exists $args{create} ) {
 		if ( $args{create} ) {
 			$flags |= DB_CREATE;
-		} else { 
+		} else {
 			$flags &= ~DB_CREATE;
+		}
+	}
+
+	if ( exists $args{truncate} ) {
+		if ( $args{truncate} ) {
+			$flags |= DB_TRUNCATE;
+		} else {
+			$flags &= ~DB_TRUNCATE;
 		}
 	}
 
@@ -357,6 +386,8 @@ sub all_open_dbs {
 
 sub associate {
 	my ( $self, %args ) = @_;
+
+	$self->assert_version(4.6, "associate");
 
 	my ( $primary, $secondary, $callback ) = @args{qw(primary secondary callback)};
 
@@ -626,6 +657,19 @@ sub cursor_stream {
 			return $ret;
 		},
 	);
+}
+
+sub assert_version {
+	my ( $self, $version, $feature ) = @_;
+
+	unless ( $self->have_version($version) ) {
+		croak "$feature requires DB $version, but we only have $BerkeleyDB::db_version";
+	}
+}
+
+sub have_version {
+	my ( $self, $version ) = @_;
+	$BerkeleyDB::db_version >= $version;
 }
 
 __PACKAGE__->meta->make_immutable;
