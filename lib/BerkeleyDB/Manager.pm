@@ -17,7 +17,7 @@ use Moose::Util::TypeConstraints;
 
 use namespace::clean -except => 'meta';
 
-our $VERSION = "0.10";
+our $VERSION = "0.11";
 
 use constant HAVE_DB_MULTIVERSION => do { local $@; eval { DB_MULTIVERSION; 1 } };
 
@@ -41,6 +41,7 @@ has [qw(
 	read_uncomitted
 	readonly
 	log_auto_remove
+	replication
 )] => (
 	isa => "Bool",
 	is  => "ro",
@@ -50,11 +51,20 @@ has [qw(
 	autocommit
 	transactions
 	snapshot
+	lock
+	deadlock_detection
 	sync
+	log
 )] => (
 	isa => "Bool",
 	is  => "ro",
 	default => 1,
+);
+
+has lk_detect => (
+	isa => "Int",
+	is  => "ro",
+	default => sub { DB_LOCK_DEFAULT },
 );
 
 has home => (
@@ -112,6 +122,18 @@ sub _build_env_flags {
 
 	my $flags = DB_INIT_MPOOL;
 
+	if ( $self->log ) {
+		$flags |= DB_INIT_LOG;
+	}
+
+	if ( $self->lock ) {
+		$flags |= DB_INIT_LOCK;
+	}
+
+	if ( $self->replication ) {
+		$flags |= DB_INIT_REP;
+	}
+
 	if ( $self->transactions ) {
 		$flags |= DB_INIT_TXN;
 
@@ -168,32 +190,27 @@ sub _build_env {
 			$dir->mkpath unless -d $dir;
 		}
 
-		my @config;
+		if ( $self->has_home ) {
+			my @config;
 
-		push @config, "set_lg_dir " . $self->log_dir if $self->has_log_dir;
-		push @config, "set_data_dir " . $self->data_dir if $self->has_data_dir;
-		push @config, "set_tmp_dir " . $self->temp_dir if $self->has_temp_dir;
-		push @config, "db_log_autoremove" if $self->log_auto_remove;
+			push @config, "set_lg_dir " . $self->log_dir if $self->has_log_dir;
+			push @config, "set_data_dir " . $self->data_dir if $self->has_data_dir;
+			push @config, "set_tmp_dir " . $self->temp_dir if $self->has_temp_dir;
 
-		if ( HAVE_DB_MULTIVERSION ) {
-			if ( $flags & DB_MULTIVERSION ) {
-				push @config, "db_multiversion";
-			}
-		}
+			if ( @config ) {
+				my $config = $home->file("DB_CONFIG");
 
-		if ( @config ) {
-			my $config = $home->file("DB_CONFIG");
-
-			unless ( -e $config ) {
-				my $fh = $config->openw;
-				$fh->print("set_lg_dir " . $self->log_dir . "\n") if $self->has_log_dir; # set_lg_dir is not a typo
-				$fh->print("set_data_dir " . $self->data_dir . "\n") if $self->has_data_dir;
+				unless ( -e $config ) {
+					my $fh = $config->openw;
+					$fh->print(join "\n", @config, "");
+				}
 			}
 		}
 	}
 
 	my $env = BerkeleyDB::Env->new(
 		( $self->has_home ? ( -Home => $self->home ) : () ),
+		( $self->deadlock_detection ? ( -LockDetect => $self->lk_detect ) : () ),
 		-Flags  => $flags,
 		-Config => $self->env_config,
 	) || die $BerkeleyDB::Error;
@@ -430,20 +447,25 @@ sub _current_transaction {
 		return $frame->[0];
 	}
 
-	return;
+	return undef;
 }
 
 sub _push_transaction {
 	my ( $self, $txn ) = @_;
+	$self->_activate_txn($txn);
 	push @{ $self->_transaction_stack }, [ $txn ];
 }
 
 sub _pop_transaction {
-	my ( $self ) = @_;
+	my $self = shift;
 
 	if ( my $d = pop @{ $self->_transaction_stack } ) {
 		shift @$d;
 		$self->close_db($_) for @$d;
+
+		if ( my $txn = $self->_current_transaction ) {
+			$self->_activate_txn($txn);
+		}
 	} else {
 		croak "Transaction stack underflowed";
 	}
@@ -458,9 +480,7 @@ sub txn_do {
 
 	ref $coderef eq 'CODE' or croak '$coderef must be a CODE reference';
 
-	my $txn = $self->txn_begin( $self->_current_transaction );
-
-	$self->_push_transaction($txn);
+	$self->txn_begin;
 
 	my @result;
 
@@ -479,7 +499,7 @@ sub txn_do {
 			}
 
 			$commit && $commit->();
-			$self->txn_commit($txn);
+			$self->txn_commit;
 
 			1;
 		};
@@ -488,18 +508,13 @@ sub txn_do {
 	};
 
 	if ( $success ) {
-		undef $txn;
-		$self->_pop_transaction;
 		return wantarray ? @result : $result[0];
 	} else {
 		my $rollback_exception = do {
 			local $@;
-			eval { $self->txn_rollback($txn); $rollback && $rollback->() };
+			eval { $self->txn_rollback; $rollback && $rollback->() };
 			$@;
 		};
-
-		undef $txn;
-		$self->_pop_transaction;
 
 		if ($rollback_exception) {
 			croak "Transaction aborted: $err, rollback failed: $rollback_exception";
@@ -509,32 +524,49 @@ sub txn_do {
 	}
 }
 
-sub txn_begin {
-	my ( $self, $parent_txn ) = @_;
-
-	my $txn = $self->env->TxnMgr->txn_begin($parent_txn || undef, $self->multiversion && $self->snapshot ? DB_TXN_SNAPSHOT : 0 ) || die $BerkeleyDB::Error;
+sub _activate_txn {
+	my ( $self, $txn ) = @_;
 
 	$txn->Txn($self->all_open_dbs);
+}
+
+sub txn_begin {
+	my $self = shift;
+
+	my $txn = $self->env->txn_begin(
+		$self->_current_transaction || undef,
+		$self->multiversion && $self->snapshot ? DB_TXN_SNAPSHOT : 0,
+	) || die $BerkeleyDB::Error;
+
+	$self->_push_transaction($txn);
 
 	return $txn;
 }
 
 sub txn_commit {
-	my ( $self, $txn ) = @_;
+	my $self = shift;
+
+	my $txn = $self->_current_transaction;
 
 	unless ( $txn->txn_commit == 0 ) {
 		die $BerkeleyDB::Error;
 	}
 
+	$self->_pop_transaction;
+
 	return 1;
 }
 
 sub txn_rollback {
-	my ( $self, $txn ) = @_;
+	my $self = shift;
+
+	my $txn = $self->_current_transaction;
 
 	unless ( $txn->txn_abort == 0 ) {
 		die $BerkeleyDB::Error;
 	}
+
+	$self->_pop_transaction;
 
 	return 1;
 }
@@ -731,6 +763,30 @@ transaction journals, etc.
 Whether C<DB_CREATE> is passed to C<Env> or C<instantiate_db> by default. Defaults to
 false.
 
+If create and specified and an alternate log, data or tmp dir is set, a
+C<DB_CONFIG> configuration file with those parameters will be written allowing
+standard Berkeley DB tools to work with the environment home directory.
+
+An existing C<DB_CONFIG> file will not be overwritten, nor will one be written
+in the current directory if C<home> is not specified.
+
+=item lock
+
+Whether C<DB_INIT_LOCK> is passed. Defaults to true.
+
+Can be set to false if B<ALL> concurrent instances are readonly.
+
+=item deadlock_detection
+
+Whether or not lock detection is set. The default is true.
+
+=item lk_detect
+
+The type of lock detection to use if C<deadlock_detection> is set. Defaults to
+C<DB_LOCK_DEFAULT>. Additional possible values are C<DB_LOCK_MAXLOCKS>,
+C<DB_LOCK_MINLOCKS>, C<DB_LOCK_MINWRITE>, C<DB_LOCK_OLDEST>, C<DB_LOCK_RANDOM>,
+and C<DB_LOCK_YOUNGEST>. See C<set_lk_detect> in the Berkeley DB reference guide.
+
 =item readonly
 
 Whether C<DB_RDONLY> is passed in the flags. Defaults to false.
@@ -924,26 +980,24 @@ transaction was successful, or C<txn_rollback> if it wasn't.
 
 Transactions are kept on a stack internally.
 
-=item txn_begin $parent_txn
+=item txn_begin
 
 Begin a new transaction.
-
-If C<$parent_txn> is provided the new transaction will be a child transaction.
 
 The new transaction is set as the active transaction for all registered
 database handles.
 
 If C<multiversion> is enabled C<DB_TXN_SNAPSHOT> is passed in as well.
 
-=item txn_commit $txn
+=item txn_commit
 
-Commit a transaction.
+Commit the currnet transaction.
 
 Will die on error.
 
-=item txn_rollback $txn
+=item txn_rollback
 
-Rollback a transaction.
+Rollback the current transaction.
 
 =item associate %args
 

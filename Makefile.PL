@@ -4,12 +4,20 @@ use strict;
 
 use ExtUtils::MakeMaker;
 
+my $checked_bdb;
+
+if ( eval { require BerkeleyDB } ) {
+    do "check_bdb_version.PL";
+	die $@ if $@;
+    $checked_bdb++;
+}
+
 WriteMakefile(
 	NAME         => 'BerkeleyDB::Manager',
 	VERSION_FROM => 'lib/BerkeleyDB/Manager.pm',
 	INSTALLDIRS  => 'site',
 	SIGN         => 1,
-	PL_FILES     => { },
+    PL_FILES     => { $checked_bdb ? () : ( "check_bdb_version.PL" => "check_bdb_version" ) },
 	PREREQ_PM    => {
 		'Test::use::ok' => 0,
 		'Test::TempDir' => 0.04,
